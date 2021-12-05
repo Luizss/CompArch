@@ -17,6 +17,8 @@ import Control.Monad.State.Lazy
 import Debug.Trace
 import System.Directory
 import Control.Monad (forM)
+import System.Exit
+import System.FilePath.Posix
 
 type AST = CTranslUnit
 
@@ -24,38 +26,57 @@ readCFile :: String -> IO (Either ParseError AST)
 readCFile fileName = do
   contents <- BS.readFile fileName
   -- parsing with preprocessing
+  parseCFilePre fileName
   parseCFile (newGCC "gcc") Nothing [] fileName
 
--- runPreprocessor (newGCC "gcc") -> CppArgs [IncludeDir ".", IncludeFile file]
--- cppOptions :: [CppOption]
--- extraOptions :: [String]
--- cppTmpDir :: Maybe FilePath
--- inputFile :: FilePath
--- outputFile :: Maybe FilePath CppArgs -> IO (Either ExitCode InputStream)
+preprocessFile :: String -> String -> IO InputStream
+preprocessFile includeDir filePath = do
+  ans <- runPreprocessor (newGCC "gcc") cppArgs
+  case ans of
+    Left exitCode -> exitWith exitCode
+    Right stream -> return stream
+  where cppArgs = CppArgs
+          [IncludeDir includeDir, IncludeFile filePath]
+          []
+          Nothing --"tmp"
+          filePath
+          Nothing
 
 langMain :: IO ()
 langMain = do
+  -- Every program is inside /Programs
   let programsDir = "Programs"
-  allFiles <- listDirectory programsDir
+  allDirs <- listDirectory programsDir
+  -- Every program is a directory
   let graphsDir = "Graphs"
   createDirectoryIfMissing False graphsDir
-  forM_ allFiles $ \file -> do
-    program <- readCFile (programsDir ++ "/" ++ file)
-    case program of
-      Left err -> putStrLn $ show err
-      Right ast -> do
-        print (prettyUsingInclude ast)
-        -- filter the relevant part of the AST
-        let ans = ast2rast ast
-        print $ length ans
-        print $ map func_name ans
-        print $ find ((=="main"). func_name) ans
-        print ans
-        -- Compute the memory usage graph
-        let graph = rast2graph ans
-        -- write graph to file
-        writeFile (graphsDir ++ "/" ++ file ++ "_graph") (prettyShowGraph graph)
-        return ()
+  allGraphs <- forM allDirs $ \dir -> do
+    let includeDir = programsDir ++ "/" ++ dir
+    allFiles <- listDirectory includeDir
+    case find (== "main.c") allFiles of
+      Nothing -> error $ "No main.c in " ++ includeDir ++ "."
+      Just mainFile -> do
+        let mainFilePath = includeDir ++ "/" ++ mainFile
+        stream <- preprocessFile includeDir mainFilePath
+        let program = parseC stream (position 0 mainFile 0 0 Nothing) --parseCFilePre readCFile (programsDir ++ "/" ++ file)
+        case program of
+          Left err -> error $ show err
+          Right ast -> do
+            print (prettyUsingInclude ast)
+            -- filter the relevant part of the AST
+            let ans = ast2rast ast
+            print $ length ans
+            --print $ map func_name ans
+            --print $ find ((=="main"). func_name) ans
+            --print ans
+            -- Compute the memory usage graph
+            let graph = rast2graph ans
+            -- write graph to file
+            writeFile (graphsDir ++ "/" ++ dir ++ "_graph") (prettyShowGraph graph)
+            return graph
+  putStrLn "MaxLen: "
+  print $  maximum . map length . concat . (map (map (\(V v x cs) -> cs))) .(map (\(Graph f r) -> f : r)) $ allGraphs
+  return ()
 
 go = langMain
 
@@ -236,7 +257,7 @@ makeGraph' :: RAST -> FSTMT -> Graph' -> State VertexId Graph'
 makeGraph' allDefs stmt graph = case stmt of
   EXPR fexpr cont -> do
 
-    --traceShowM $ "Hmmm1... " ++ show graph
+    traceShowM $ "Hmmm1... " ++ show graph
 
     let memUsage = extractMemUsage fexpr
         Graph (V v x conns) rest = graph
@@ -250,23 +271,29 @@ makeGraph' allDefs stmt graph = case stmt of
 
   FCALL funcName cont -> do
 
-    --traceShowM $ "Hmmm2... " ++ show graph
+    traceShowM $ "Hmmm2... " ++ show graph
 
     case find ((==funcName) . func_name) allDefs of
 
       Nothing -> do
         --traceShowM $ "Hmmm21... " ++ show graph
-        ans <-go cont graph --error $ "No function named " ++ funcName ++ "."
+        ans <- go cont graph --error $ "No function named " ++ funcName ++ "."
         --traceShowM $ "Hmmm22... " ++ show ans
         return ans
+
       Just (FUNC _ funcBody) -> do
+
+        let Graph (V f x conns) rest = graph
+
+        vr <- newVertexId
         --traceShowM $ "aaaaaaaaaaaaaa"
-        graph' <- go funcBody graph
-        go cont graph'
+        Graph (V f' x' conns') rest' <- go funcBody $ Graph (V vr 0 []) [] --graph
+
+        go cont $ Graph (V f' x' conns') (V f x (vr:conns) : (rest ++ rest')) --graph'
 
   LOOP loop cont -> do
 
-    --traceShowM $ "Hmmm3... " ++ show graph
+    traceShowM $ "Hmmm3... " ++ show graph
 
     let Graph (V f x conns) rest = graph
 
@@ -274,13 +301,22 @@ makeGraph' allDefs stmt graph = case stmt of
 
     Graph (V f' x' conns') rest' <- go loop $ Graph (V vl 0 []) []
 
-    --traceShowM $ "Hmmm31... " ++ show (f', x', f, conns', V f' x' (f : conns'))
+    vr <- newVertexId
 
-    go cont $ Graph (V f' x' (f : conns')) (V f x (vl:conns) : nub (rest' ++ rest))
+    traceShowM $ "Hmmm31... " ++ show (f', x', f, conns', V f' x' (f : conns'))
+
+    go cont
+      $ Graph
+      (V vr 0 [f])
+      (V f' x' (vr : conns')
+       : V f x (vl : conns)
+       : nub (rest ++ rest'))
+
+    --go cont $ Graph (V f' x' (f : conns')) (V f x (vl:conns) : nub (rest ++ rest'))
 
   IF br1 (Just br2) cont -> do
 
-    --traceShowM $ "Hmmm4... " ++ show graph
+    traceShowM $ "Hmmm4... " ++ show graph
 
     let Graph (V f x conns) rest = graph
 
@@ -297,11 +333,11 @@ makeGraph' allDefs stmt graph = case stmt of
       (V f1 x1 (vr:conns1)
        : V f2 x2 (vr:conns2)
        : V f x (v1:v2:conns)
-       : nub (rest1 ++ rest2 ++ rest))
+       : nub (rest ++ rest1 ++ rest2))
 
   IF br1 Nothing cont -> do
 
-    --traceShowM $ "Hmmm5... " ++ show graph
+    traceShowM $ "Hmmm5... " ++ show graph
 
     let Graph (V f x conns) rest = graph
 
@@ -309,10 +345,10 @@ makeGraph' allDefs stmt graph = case stmt of
 
     Graph (V f1 x1 conns1) rest1 <- go br1 $ Graph (V v1 0 []) []
 
-    --traceShowM $ "Hey " ++ show (rest, rest1, V f1 x1 conns1, V f x conns)
+    traceShowM $ "Hey " ++ show (rest, rest1, V f1 x1 conns1, V f x conns)
     vr <- newVertexId
 
-    go cont $ Graph (V vr 0 []) (V f1 x1 (vr:conns1) : V f x (v1:vr:conns) : nub (rest1 ++ rest))
+    go cont $ Graph (V vr 0 []) (V f1 x1 (vr:conns1) : V f x (v1:vr:conns) : nub (rest ++ rest1))
 
   RETURN -> do
     --traceShowM $ "Hmmm6... " ++ show graph
@@ -329,4 +365,4 @@ prettyShowGraph (Graph focus rest)
 
     prettyShowVertex :: Vertex VertexId MemUsage -> String
     prettyShowVertex (V vid mUse conns)
-      = show vid ++ ": (" ++ show mUse ++ "," ++ show conns ++ ")"
+      = "\"" ++ show vid ++ "\": [" ++ show mUse ++ "," ++ show conns ++ "]"

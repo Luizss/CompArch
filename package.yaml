@@ -39,6 +39,7 @@ executables:
     - bytestring <= 0.10.12.0
     - mtl <= 2.2.2
     - directory <= 1.3.6.0
+    - filepath <= 1.4.2.1
 tests:
   Project-test:
     main:                Spec.hs
